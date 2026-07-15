@@ -1,0 +1,22 @@
+{
+  "name": "betadda-api",
+  "private": true,
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vercel dev",
+    "build": "echo API Project"
+  },
+  "dependencies": {
+    "@vercel/node": "^5.3.26",
+    "firebase": "^12.0.0",
+    "firebase-admin": "^13.0.0"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "typescript": "^5.9.0"
+  },
+  "engines": {
+    "node": ">=22"
+  }
+}
