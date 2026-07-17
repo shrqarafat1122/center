@@ -153,7 +153,7 @@ export function sanitize(body: any, fields: SanitizeKey[]): void {
  */
 export function setCors(req: VercelRequest, res: VercelResponse): void {
   const origin = (req.headers['origin'] as string) || '';
-  const raw = process.env.NEXT_PUBLIC_APP_URL || '';
+  const raw = process.env.VERCEL_API || '';
   const allowed = raw.split(',').map(s => s.trim().replace(/\/+$/, '')).filter(Boolean);
 
   if (origin && (allowed.length === 0 || allowed.includes(origin.replace(/\/+$/, '')))) {

@@ -352,7 +352,10 @@ async function handleAction(req: VercelRequest, res: VercelResponse, uid: string
         discardPile,
         [`playerData.${uid}.handCount`]: newHand.length,
         [`playerData.${uid}.hasActed`]:  true,
+<<<<<<< HEAD
         [`playerData.${uid}.missedTurns`]: 0, // manual action = reset missed
+=======
+>>>>>>> 4cc695c3468b8e9e48dee95524a42396607573e1
         ...turn,
       });
       return { action: 'discard', cardId, nextTurnUid: turn.currentTurnUid };
@@ -651,7 +654,10 @@ async function handleAutoDiscard(req: VercelRequest, res: VercelResponse, uid: s
   sanitize(req.body, ['tableId']);
   const { tableId } = req.body;
 
+<<<<<<< HEAD
   const tableRef  = db.collection('jokerPairTables').doc(tableId);
+=======
+>>>>>>> 4cc695c3468b8e9e48dee95524a42396607573e1
   const gameRef   = db.collection('jokerPairGames').doc(tableId);
   const myPrivRef = gameRef.collection('private').doc(uid);
   const srvRef    = gameRef.collection('private').doc('_server');
@@ -670,6 +676,7 @@ async function handleAutoDiscard(req: VercelRequest, res: VercelResponse, uid: s
     const duration = game.turnDuration || 60;
     if (elapsed < duration - 2) return { skipped: true, reason: 'Turn not expired yet' };
 
+<<<<<<< HEAD
     // ── 3 missed turns = forfeit — opponent jeet jata hai ────────────────────
     const missed = ((game.playerData?.[uid]?.missedTurns || 0) as number) + 1;
     if (missed >= 3) {
@@ -687,6 +694,8 @@ async function handleAutoDiscard(req: VercelRequest, res: VercelResponse, uid: s
       return { forfeited: true, winnerId, loserId: uid, missedTurns: missed };
     }
 
+=======
+>>>>>>> 4cc695c3468b8e9e48dee95524a42396607573e1
     if (!privSnap.exists) throw new Error('Player not found');
     const priv        = privSnap.data()!;
     let hand: string[] = [...(priv.hand || [])];
@@ -719,10 +728,16 @@ async function handleAutoDiscard(req: VercelRequest, res: VercelResponse, uid: s
       drawCount: drawPile.length,
       [`playerData.${uid}.handCount`]: hand.length,
       [`playerData.${uid}.hasActed`]:  true,
+<<<<<<< HEAD
       [`playerData.${uid}.missedTurns`]: missed, // track missed turns
       ...turn,
     });
     return { autoDiscarded: cardToDiscard, nextTurnUid: turn.currentTurnUid, missedTurns: missed };
+=======
+      ...turn,
+    });
+    return { autoDiscarded: cardToDiscard, nextTurnUid: turn.currentTurnUid };
+>>>>>>> 4cc695c3468b8e9e48dee95524a42396607573e1
   });
 
   // ── Forfeit hua toh winner ko payout karo ──────────────────────────────────
