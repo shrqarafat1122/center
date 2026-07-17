@@ -4,8 +4,7 @@ import { randomInt }                          from 'crypto';
 import { db }                                 from '../lib/firebaseAdmin';
 import { FieldValue }                         from 'firebase-admin/firestore';
 import { internalWalletTransaction }          from '../lib/walletInternal';
-import { verifyToken, sanitize, setCors }              from '../lib/middleware';
-
+import { verifyToken, sanitize }              from '../lib/middleware';
 
 // ─── Types + Helpers ─────────────────────────────────────────────────────────
 interface GameCard    { id: string; rank: string; suit: string; }
@@ -110,15 +109,24 @@ async function handleJoin(req: VercelRequest, res: VercelResponse, uid: string) 
   if (players.length >= maxPlayers)
     return res.status(400).json({ error: 'Table is full' });
 
-  await internalWalletTransaction({
+  // Unique key per join attempt — static key exploit hota tha: join → leave
+  // (refund) → dobara join pe DEDUCT duplicate banta (paisa katta nahi) lekin
+  // player game mein aa jata = free entry
+  const joinTs = Date.now();
+
+  const deductResult = await internalWalletTransaction({
     action:         'DEDUCT',
     uid,
     amount:         entryFee,
     type:           'GAME_ENTRY',
     game:           'JokerPair',
     description:    `Joker Pair entry - Table ${tableId}`,
-    idempotencyKey: `jp_join_${tableId}_${uid}`,
+    idempotencyKey: `jp_join_${tableId}_${uid}_${joinTs}`,
   });
+
+  // Duplicate = paisa deduct NAHI hua — bina payment ke game mein entry mat do
+  if (deductResult.duplicate)
+    return res.status(409).json({ error: 'Duplicate join request, try again' });
 
   try {
     await db.runTransaction(async (tx) => {
@@ -146,7 +154,7 @@ async function handleJoin(req: VercelRequest, res: VercelResponse, uid: string) 
       game:           'JokerPair',
       description:    `Joker Pair join refund - Table ${tableId}`,
       balanceType:    'depositBalance',
-      idempotencyKey: `jp_join_refund_${tableId}_${uid}`,
+      idempotencyKey: `jp_join_refund_${tableId}_${uid}_${joinTs}`,
     }).catch(console.error);
 
     return res.status(500).json({ error: e.message });
@@ -180,24 +188,32 @@ async function handleStart(req: VercelRequest, res: VercelResponse, uid: string)
     const jokerCard = shuffled[0];
     const remaining = shuffled.slice(1);
 
-    const playerData: Record<string, any> = {};
+    // SECURITY: hands/drawPile ab main doc mein NAHI jaate — client us doc
+    // pe subscribe karta hai, pehle opponent ke cards + poora deck dikh jata
+    // tha. Ab: main doc = public state (counts), private/{uid} = apna hand,
+    // private/_server = draw pile (sirf server padhta hai).
+    const playerMeta: Record<string, any> = {};
     let cardIdx = 0;
     for (const p of players) {
-      playerData[p] = {
-        uid:      p,
-        name:     table.playerNames?.[p] || 'Player',
-        avatar:   table.playerAvatars?.[p] || '',
-        hand:     remaining.slice(cardIdx, cardIdx + 5).map((c) => c.id),
-        groups:   [],
-        hasActed: false,
+      const hand = remaining.slice(cardIdx, cardIdx + 5).map((c) => c.id);
+      tx.set(gameRef.collection('private').doc(p), { hand, groups: [] });
+      playerMeta[p] = {
+        uid:       p,
+        name:      table.playerNames?.[p] || 'Player',
+        avatar:    table.playerAvatars?.[p] || '',
+        handCount: hand.length,
+        hasActed:  false,
       };
       cardIdx += 5;
     }
 
+    const drawPile = remaining.slice(cardIdx).map((c) => c.id);
+    tx.set(gameRef.collection('private').doc('_server'), { drawPile });
+
     tx.set(gameRef, {
-      tableId, status: 'playing', players, playerData,
-      deck:             shuffled,
-      drawPile:         remaining.slice(cardIdx).map((c) => c.id),
+      tableId, status: 'playing', players,
+      playerData:       playerMeta,   // public meta only — no hands
+      drawCount:        drawPile.length,
       discardPile:      [],
       jokerCard,
       jokerRank:        jokerCard.rank,
@@ -231,7 +247,11 @@ async function handleAction(req: VercelRequest, res: VercelResponse, uid: string
   if (!validActions.includes(action))
     throw Object.assign(new Error('Invalid action'), { status: 400 });
 
-  const gameRef = db.collection('jokerPairGames').doc(tableId);
+  const gameRef   = db.collection('jokerPairGames').doc(tableId);
+  // Private docs: apna hand yahan hai (main doc mein sirf counts)
+  const myPrivRef = gameRef.collection('private').doc(uid);
+  const srvRef    = gameRef.collection('private').doc('_server');
+  const FULL_DECK = buildDeck();
 
   // ── updateGroups: alag transaction — turn check nahi hota ──────────────────
   if (action === 'updateGroups') {
@@ -239,17 +259,18 @@ async function handleAction(req: VercelRequest, res: VercelResponse, uid: string
       throw Object.assign(new Error('Invalid groups'), { status: 400 });
 
     await db.runTransaction(async (tx) => {
-      const snap = await tx.get(gameRef);
+      const [snap, privSnap] = await Promise.all([tx.get(gameRef), tx.get(myPrivRef)]);
       if (!snap.exists)
         throw Object.assign(new Error('Game not found'), { status: 404 });
 
       const game = snap.data()!;
       if (game.status !== 'playing')
         throw Object.assign(new Error('Game is not active'), { status: 400 });
-      if (!game.players.includes(uid))
+      if (!game.players.includes(uid) || !privSnap.exists)
         throw Object.assign(new Error('Not a player in this game'), { status: 403 });
 
-      tx.update(gameRef, { [`playerData.${uid}.groups`]: payload.groups });
+      // Groups private doc mein — opponent inse hand ke cards infer kar leta
+      tx.update(myPrivRef, { groups: payload.groups });
     });
 
     return res.status(200).json({ success: true });
@@ -257,7 +278,9 @@ async function handleAction(req: VercelRequest, res: VercelResponse, uid: string
 
   // ── All other actions: single transaction ──────────────────────────────────
   const result = await db.runTransaction(async (tx) => {
-    const snap = await tx.get(gameRef);
+    const [snap, privSnap, srvSnap] = await Promise.all([
+      tx.get(gameRef), tx.get(myPrivRef), tx.get(srvRef),
+    ]);
     if (!snap.exists) throw new Error('Game not found');
     const game = snap.data()!;
 
@@ -267,63 +290,79 @@ async function handleAction(req: VercelRequest, res: VercelResponse, uid: string
     if (action === 'declare' && game.payoutDone)
       return { valid: true, action: 'declare', alreadyPaid: true, winnerId: game.winnerId };
 
+    if (!privSnap.exists) throw new Error('Player not found');
+    const priv = privSnap.data()!;
+    const hand: string[] = [...(priv.hand || [])];
     const playerData = { ...game.playerData };
-    const player     = { ...playerData[uid] };
-    if (!player) throw new Error('Player not found');
 
     // ── pickDraw ──────────────────────────────────────────────────────────────
     if (action === 'pickDraw') {
-      if (player.hand.length !== 5)   throw new Error('Already picked a card this turn');
-      if (game.drawPile.length === 0) throw new Error('Draw pile is empty');
+      if (hand.length !== 5) throw new Error('Already picked a card this turn');
+      let drawPile: string[] = [...(srvSnap.data()?.drawPile || [])];
+      let discardPile: string[] = [...(game.discardPile || [])];
 
-      const drawPile  = [...game.drawPile];
-      const pickedId  = drawPile.pop()!;
-      player.hand     = [...player.hand, pickedId];
-      playerData[uid] = player;
+      // Draw pile khali? Discard pile (top card chhod ke) shuffle karke naya
+      // draw pile banao — pehle yahan error aata tha aur game atak jata tha
+      if (drawPile.length === 0) {
+        if (discardPile.length <= 1) throw new Error('No cards left to draw');
+        const top   = discardPile.pop()!;
+        drawPile    = shuffle(discardPile);
+        discardPile = [top];
+      }
 
-      tx.update(gameRef, { drawPile, playerData });
+      const pickedId = drawPile.pop()!;
+      tx.update(srvRef, { drawPile });
+      tx.update(myPrivRef, { hand: [...hand, pickedId] });
+      tx.update(gameRef, {
+        drawCount: drawPile.length,
+        discardPile,
+        [`playerData.${uid}.handCount`]: hand.length + 1,
+      });
       return { action: 'pickDraw', cardId: pickedId };
     }
 
     // ── pickDiscard ───────────────────────────────────────────────────────────
     if (action === 'pickDiscard') {
-      if (player.hand.length !== 5)      throw new Error('Already picked a card this turn');
+      if (hand.length !== 5)             throw new Error('Already picked a card this turn');
       if (game.discardPile.length === 0) throw new Error('Discard pile is empty');
 
       const discardPile = [...game.discardPile];
       const pickedId    = discardPile.pop()!;
-      player.hand       = [...player.hand, pickedId];
-      playerData[uid]   = player;
-
-      tx.update(gameRef, { discardPile, playerData });
+      tx.update(myPrivRef, { hand: [...hand, pickedId] });
+      tx.update(gameRef, {
+        discardPile,
+        [`playerData.${uid}.handCount`]: hand.length + 1,
+      });
       return { action: 'pickDiscard', cardId: pickedId };
     }
 
     // ── discard ───────────────────────────────────────────────────────────────
     if (action === 'discard') {
       const cardId: string = payload?.cardId;
-      if (!cardId)                       throw new Error('Missing cardId');
-      if (player.hand.length !== 6)      throw new Error('Pick a card before discarding');
-      if (!player.hand.includes(cardId)) throw new Error('Card not in hand');
+      if (!cardId)                throw new Error('Missing cardId');
+      if (hand.length !== 6)      throw new Error('Pick a card before discarding');
+      if (!hand.includes(cardId)) throw new Error('Card not in hand');
 
-      player.hand     = player.hand.filter((c: string) => c !== cardId);
-      player.groups   = [];
-      player.hasActed = true;
-      playerData[uid] = player;
-
+      const newHand     = hand.filter((c) => c !== cardId);
       const discardPile = [...game.discardPile, cardId];
       const turn        = nextTurn(game.players, game.currentTurnIndex);
 
-      tx.update(gameRef, { playerData, discardPile, ...turn });
+      tx.update(myPrivRef, { hand: newHand, groups: [] });
+      tx.update(gameRef, {
+        discardPile,
+        [`playerData.${uid}.handCount`]: newHand.length,
+        [`playerData.${uid}.hasActed`]:  true,
+        ...turn,
+      });
       return { action: 'discard', cardId, nextTurnUid: turn.currentTurnUid };
     }
 
     // ── declare ───────────────────────────────────────────────────────────────
     if (action === 'declare') {
-      if (player.hand.length !== 6) throw new Error('Pick a card before declaring');
+      if (hand.length !== 6) throw new Error('Pick a card before declaring');
 
-      const groups     = player.groups || [];
-      const validation = validateDeclare(player.hand, groups, game.jokerRank, game.deck);
+      const groups     = (priv.groups || []) as PlayerGroup[];
+      const validation = validateDeclare(hand, groups, game.jokerRank, FULL_DECK);
       if (!validation.valid) return { valid: false, reason: validation.reason };
 
       const prizePool    = game.prizePool as number;
@@ -333,7 +372,7 @@ async function handleAction(req: VercelRequest, res: VercelResponse, uid: string
       tx.update(gameRef, {
         status:      'finished',
         winnerId:    uid,
-        winnerGroups: groups,
+        winnerGroups: groups,   // finish pe reveal karna theek hai
         finishedAt:  FieldValue.serverTimestamp(),
         payoutDone:  false,
       });
@@ -342,6 +381,7 @@ async function handleAction(req: VercelRequest, res: VercelResponse, uid: string
       return { valid: true, action: 'declare', winnerId: uid, winnerAmount, prizePool };
     }
 
+    void playerData;
     throw new Error(`Unknown action: ${action}`);
   });
 
@@ -443,29 +483,53 @@ async function handleLeave(req: VercelRequest, res: VercelResponse, uid: string)
     if (!players.includes(uid))
       return res.status(400).json({ error: 'Not in this table' });
 
-    if (entryFee > 0) {
-      await internalWalletTransaction({
-        action:         'ADD',
-        uid,
-        amount:         entryFee,
-        type:           'REFUND',
-        game:           'JokerPair',
-        description:    `Joker Pair refund - Table ${tableId}`,
-        balanceType:    'depositBalance',
-        idempotencyKey: `jp_refund_waiting_${tableId}_${uid}`,
-      });
-    }
+    // PEHLE atomically remove karo, refund BAAD mein — warna do rapid leave
+    // calls dono refund kara sakti thin (double refund race)
+    const removed = await db.runTransaction(async (tx) => {
+      const fresh = await tx.get(tableRef);
+      if (!fresh.exists) return false;
+      const cur = fresh.data()!;
+      if (cur.status !== 'waiting') return false;
+      const curPlayers = (cur.players || []) as string[];
+      if (!curPlayers.includes(uid)) return false;
 
-    const remaining = players.filter((p) => p !== uid);
-    if (remaining.length === 0) {
-      await tableRef.delete();
-    } else {
-      await tableRef.update({
-        players:                  FieldValue.arrayRemove(uid),
-        [`playerNames.${uid}`]:   FieldValue.delete(),
-        [`playerAvatars.${uid}`]: FieldValue.delete(),
-        prizePool:                FieldValue.increment(-entryFee),
-      });
+      const remaining = curPlayers.filter((p) => p !== uid);
+      if (remaining.length === 0) {
+        tx.delete(tableRef);
+      } else {
+        tx.update(tableRef, {
+          players:                  FieldValue.arrayRemove(uid),
+          [`playerNames.${uid}`]:   FieldValue.delete(),
+          [`playerAvatars.${uid}`]: FieldValue.delete(),
+          prizePool:                FieldValue.increment(-entryFee),
+        });
+      }
+      return true;
+    });
+
+    if (!removed)
+      return res.status(400).json({ error: 'Not in this table' });
+
+    if (entryFee > 0) {
+      try {
+        await internalWalletTransaction({
+          action:         'ADD',
+          uid,
+          amount:         entryFee,
+          type:           'REFUND',
+          game:           'JokerPair',
+          description:    `Joker Pair refund - Table ${tableId}`,
+          balanceType:    'depositBalance',
+          idempotencyKey: `jp_refund_waiting_${tableId}_${uid}_${Date.now()}`,
+        });
+      } catch (refundErr: any) {
+        console.error('CRITICAL: JokerPair leave refund failed:', { uid, tableId, error: refundErr });
+        await db.collection('pendingRefunds').add({
+          uid, tableId, amount: entryFee, game: 'JokerPair', reason: 'leave_waiting',
+          error: refundErr?.message || '', createdAt: FieldValue.serverTimestamp(), resolved: false,
+        }).catch(() => {});
+        return res.status(500).json({ error: 'Left table but refund failed — support notified' });
+      }
     }
 
     return res.status(200).json({ success: true, refunded: entryFee });
@@ -494,11 +558,19 @@ async function handleLeave(req: VercelRequest, res: VercelResponse, uid: string)
         });
       }
 
-      await db.batch()
-        .update(gameRef.id ? gameRef : gameRef, {}) // skip if not exists
-        ?? null;
+      // Game doc ho to finished mark karo, table bhi — pehle yahan broken
+      // batch code tha (empty update crash karta: "must not be empty")
+      const noopBatch = db.batch();
+      if (gameSnap.exists) {
+        noopBatch.update(gameRef, {
+          status:       'finished',
+          finishedAt:   FieldValue.serverTimestamp(),
+          finishReason: 'no_opponent',
+        });
+      }
+      noopBatch.update(tableRef, { status: 'finished' });
+      await noopBatch.commit();
 
-      await tableRef.update({ status: 'finished' });
       return res.status(200).json({ success: true, refunded: entryFee });
     }
 
@@ -578,9 +650,14 @@ async function handleAutoDiscard(req: VercelRequest, res: VercelResponse, uid: s
   sanitize(req.body, ['tableId']);
   const { tableId } = req.body;
 
-  const gameRef = db.collection('jokerPairGames').doc(tableId);
+  const gameRef   = db.collection('jokerPairGames').doc(tableId);
+  const myPrivRef = gameRef.collection('private').doc(uid);
+  const srvRef    = gameRef.collection('private').doc('_server');
+
   const result  = await db.runTransaction(async (tx) => {
-    const snap = await tx.get(gameRef);
+    const [snap, privSnap, srvSnap] = await Promise.all([
+      tx.get(gameRef), tx.get(myPrivRef), tx.get(srvRef),
+    ]);
     if (!snap.exists) throw new Error('Game not found');
     const game = snap.data()!;
 
@@ -591,34 +668,40 @@ async function handleAutoDiscard(req: VercelRequest, res: VercelResponse, uid: s
     const duration = game.turnDuration || 60;
     if (elapsed < duration - 2) return { skipped: true, reason: 'Turn not expired yet' };
 
-    const playerData  = { ...game.playerData };
-    const player      = { ...playerData[uid] };
-    let drawPile      = [...game.drawPile];
+    if (!privSnap.exists) throw new Error('Player not found');
+    const priv        = privSnap.data()!;
+    let hand: string[] = [...(priv.hand || [])];
+    let drawPile: string[] = [...(srvSnap.data()?.drawPile || [])];
     let discardPile   = [...game.discardPile];
 
-    if (player.hand.length === 5) {
+    if (hand.length === 5) {
       if (drawPile.length === 0) {
         if (discardPile.length <= 1) throw new Error('No cards left to draw');
         const top   = discardPile.pop()!;
         drawPile    = shuffle(discardPile);
         discardPile = [top];
       }
-      player.hand = [...player.hand, drawPile.pop()!];
+      hand = [...hand, drawPile.pop()!];
     }
 
-    const cardsInGroups = new Set((player.groups || []).flatMap((g: any) => g.cards || []));
-    const candidates    = player.hand.filter((c: string) => !cardsInGroups.has(c));
-    const pool          = candidates.length > 0 ? candidates : player.hand;
+    const cardsInGroups = new Set(((priv.groups || []) as any[]).flatMap((g: any) => g.cards || []));
+    const candidates    = hand.filter((c: string) => !cardsInGroups.has(c));
+    const pool          = candidates.length > 0 ? candidates : hand;
     const cardToDiscard = pool[randomInt(0, pool.length)];
 
-    player.hand     = player.hand.filter((c: string) => c !== cardToDiscard);
-    player.groups   = [];
-    player.hasActed = true;
-    playerData[uid] = player;
+    hand = hand.filter((c: string) => c !== cardToDiscard);
     discardPile.push(cardToDiscard);
 
     const turn = nextTurn(game.players, game.currentTurnIndex);
-    tx.update(gameRef, { playerData, drawPile, discardPile, ...turn });
+    tx.update(myPrivRef, { hand, groups: [] });
+    tx.update(srvRef, { drawPile });
+    tx.update(gameRef, {
+      discardPile,
+      drawCount: drawPile.length,
+      [`playerData.${uid}.handCount`]: hand.length,
+      [`playerData.${uid}.hasActed`]:  true,
+      ...turn,
+    });
     return { autoDiscarded: cardToDiscard, nextTurnUid: turn.currentTurnUid };
   });
 
@@ -655,9 +738,6 @@ async function handleRetryPayout(req: VercelRequest, res: VercelResponse, uid: s
 
 // ─── Router ───────────────────────────────────────────────────────────────────
 export default async function handler(req: VercelRequest, res: VercelResponse) {
-  setCors(req, res);
-  if (req.method === 'OPTIONS')
-    return res.status(204).end();
   if (req.method !== 'POST')
     return res.status(405).json({ error: 'Method not allowed' });
 
