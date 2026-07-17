@@ -1,7 +1,7 @@
 // lib/walletInternal.ts
 // ✅ Sirf server-side game APIs use karein — client ke paas yeh kabhi nahi aana chahiye
 import { db as adminDb } from './firebaseAdmin';
-import { FieldValue } from './firestoreRest';
+import { FieldValue } from 'firebase-admin/firestore';
 
 interface WalletData {
   depositBalance:  number;

@@ -1,5 +1,5 @@
 import { db } from "../lib/firebaseAdmin";
-import { FieldValue } from '../lib/firestoreRest';
+import { FieldValue } from "firebase-admin/firestore";
 
 export default async function handler(req: any, res: any) {
   try {

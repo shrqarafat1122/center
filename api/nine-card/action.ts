@@ -1,9 +1,9 @@
-import type { VercelRequest, VercelResponse } from '../lib/vercelShim';
-import { FieldValue, Timestamp }              from '../lib/firestoreRest';
+import type { VercelRequest, VercelResponse } from '@vercel/node';
+import { FieldValue, Timestamp }              from 'firebase-admin/firestore';
 import { db }                                 from '../lib/firebaseAdmin';
 import { internalWalletTransaction, betHistory } from '../lib/walletInternal';
-import { verifyToken, sanitize }              from '../lib/middleware';
-import { randomInt }                          from '../lib/nodeCompat';
+import { verifyToken, sanitize, setCors }     from '../lib/middleware';
+import { randomInt }                          from 'crypto';
 
 export const config = { maxDuration: 30 };
 
@@ -235,6 +235,9 @@ async function payDraw(
 // ─── Main Handler ─────────────────────────────────────────────────────────────
 
 export default async function handler(req: VercelRequest, res: VercelResponse) {
+  setCors(req, res);
+  if (req.method === 'OPTIONS')
+    return res.status(204).end();
   if (req.method !== 'POST')
     return res.status(405).json({ error: 'Method not allowed' });
 

@@ -1,7 +1,7 @@
 // api/ludo/action.ts
-import type { VercelRequest, VercelResponse } from '../lib/vercelShim';
-import { randomInt }                          from '../lib/nodeCompat';
-import { FieldValue }                         from '../lib/firestoreRest';
+import type { VercelRequest, VercelResponse } from '@vercel/node';
+import { randomInt }                          from 'crypto';
+import { FieldValue }                         from 'firebase-admin/firestore';
 import { db }                                 from '../lib/firebaseAdmin';
 import { internalWalletTransaction }          from '../lib/walletInternal';
 import { verifyToken, sanitize, setCors }     from '../lib/middleware';
@@ -138,8 +138,8 @@ const cleanupTable = async (tableId: string): Promise<void> => {
 // Main Handler
 // ─────────────────────────────────────────────────────────────────────────────
 export default async function handler(req: VercelRequest, res: VercelResponse) {
-  setCors(res);
-  if (req.method === 'OPTIONS') return res.status(200).end();
+  setCors(req, res);
+  if (req.method === 'OPTIONS') return res.status(204).end();
   if (req.method !== 'POST') {
     res.status(405).json({ ok: false, error: 'Method not allowed' });
     return;

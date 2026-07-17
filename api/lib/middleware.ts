@@ -1,8 +1,7 @@
 
-import type { VercelRequest, VercelResponse } from './vercelShim';
-import { timingSafeEqual }                     from './nodeCompat';
+import type { VercelRequest, VercelResponse } from '@vercel/node';
+import { timingSafeEqual }                     from 'crypto';
 import { auth as adminAuth }                   from './firebaseAdmin';
-import { getEnv }                              from './env';
 
 // ─── Auth ─────────────────────────────────────────────────────────────────────
 
@@ -53,7 +52,6 @@ const SANITIZE_RULES = {
   lobbyId:     { type: 'string', maxLen: 50,     pattern: /^[a-zA-Z0-9_-]+$/,            },
   name:        { type: 'string', maxLen: 30,     pattern: /^[\w\s\u0900-\u097F-]{1,30}$/ },
   action:      { type: 'string', maxLen: 20,     pattern: /^[a-zA-Z-]+$/,                },
-  claimType:   { type: 'string', maxLen: 12,     pattern: /^(earlyFive|topLine|middleLine|bottomLine|fullHouse)$/ },
   amount:      { type: 'number', min: 1,         max: 100000,                             },
   entryFee:    { type: 'number', min: 1,         max: 10000,                              },
   selectedFee:    { type: 'number', min: 1,         max: 10000,                              },
@@ -149,12 +147,19 @@ export function sanitize(body: any, fields: SanitizeKey[]): void {
 // ─── CORS ─────────────────────────────────────────────────────────────────────
 
 /**
- * setCors — sirf apna domain allow karo
- * NEXT_PUBLIC_APP_URL env var set karo Vercel Dashboard mein
+ * setCors — request ka origin echo karo
+ * NEXT_PUBLIC_APP_URL khali/unset → SAB origins allowed (security token check se hai)
+ * NEXT_PUBLIC_APP_URL set (comma-separated) → sirf listed domains allowed
  */
-export function setCors(res: VercelResponse): void {
-  const origin = getEnv().NEXT_PUBLIC_APP_URL || '';
-  res.setHeader('Access-Control-Allow-Origin', origin);
+export function setCors(req: VercelRequest, res: VercelResponse): void {
+  const origin = (req.headers['origin'] as string) || '';
+  const raw = process.env.VERCEL_API || '';
+  const allowed = raw.split(',').map(s => s.trim().replace(/\/+$/, '')).filter(Boolean);
+
+  if (origin && (allowed.length === 0 || allowed.includes(origin.replace(/\/+$/, '')))) {
+    res.setHeader('Access-Control-Allow-Origin', origin);
+  }
+  res.setHeader('Vary', 'Origin');
   res.setHeader('Access-Control-Allow-Methods', 'POST, OPTIONS');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
 }
@@ -174,7 +179,7 @@ export async function withMiddleware(
   opts: MiddlewareOptions = {},
 ): Promise<string | null> {
   // CORS
-  setCors(res);
+  setCors(req, res);
   if (req.method === 'OPTIONS') { res.status(200).end(); return null; }
 
   // Method check

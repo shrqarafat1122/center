@@ -1,7 +1,7 @@
 // api/poker/action.ts
-import type { VercelRequest, VercelResponse } from '../lib/vercelShim';
-import { FieldValue, Timestamp, Transaction, DocumentReference } from '../lib/firestoreRest';
-import { randomInt }                          from '../lib/nodeCompat';
+import type { VercelRequest, VercelResponse } from '@vercel/node';
+import { FieldValue, Timestamp }              from 'firebase-admin/firestore';
+import { randomInt }                          from 'crypto';
 import { db }                                 from '../lib/firebaseAdmin';
 import { internalWalletTransaction, betHistory } from '../lib/walletInternal';
 import { verifyToken, sanitize }              from '../lib/middleware';
@@ -77,7 +77,6 @@ interface PokerTable {
   afkWarningEndsAt?: any;
   deck:             Card[];
   handNumber:       number;
-  lastRaiseSize?:   number;
   lastBrokePlayers: Array<{ uid: string; name: string }>;
   lastHandWins?:    Record<string, number>;
   lastHandAllIn?:   boolean;
@@ -277,7 +276,6 @@ function cleanHandState(): Record<string, any> {
     pot:              0,
     sidePots:         [],
     currentBet:       0,
-    lastRaiseSize:    0,
     dealerSeat:       0,
     activePlayerUid:  null,
     turnExpiresAt:    null,
@@ -325,21 +323,15 @@ function cleanPlayer(p: PokerPlayer, finalChips: number): PokerPlayer {
 // ─────────────────────────────────────────────────────────────────────────────
 // separatePlayersAfterHand
 // DISCONNECTED players with chips stay seated — they can reconnect
-// FIX: seat chhodne wale (AFK/leave/broke) ka bacha stack ab stackCredits mein
-// aata hai — caller wallet mein credit karta hai. Pehle chips gayab ho jaate the.
 // ─────────────────────────────────────────────────────────────────────────────
-interface StackCredit { uid: string; name: string; chips: number; }
-
 function separatePlayersAfterHand(settledPlayers: PokerPlayer[]): {
   showdownPlayers: PokerPlayer[];
   seated:          PokerPlayer[];
   newSpectators:   any[];
-  stackCredits:    StackCredit[];
 } {
   const showdownPlayers: PokerPlayer[] = [];
   const seated:          PokerPlayer[] = [];
   const newSpectators:   any[]         = [];
-  const stackCredits:    StackCredit[] = [];
 
   for (const p of settledPlayers) {
     const mustLeave =
@@ -348,9 +340,7 @@ function separatePlayersAfterHand(settledPlayers: PokerPlayer[]): {
       p.seatStatus === 'LEFT_SEAT';
 
     if (mustLeave) {
-      // Wallet credit hoga — isliye table pe chips 0 (double-cashout impossible)
-      if (p.chips > 0) stackCredits.push({ uid: p.uid, name: p.name, chips: p.chips });
-      showdownPlayers.push({ ...p, chips: 0, seatStatus: 'LEFT_SEAT' });
+      showdownPlayers.push({ ...p, seatStatus: 'LEFT_SEAT' });
       newSpectators.push({
         uid:         p.uid,
         name:        p.name,
@@ -367,33 +357,7 @@ function separatePlayersAfterHand(settledPlayers: PokerPlayer[]): {
     }
   }
 
-  return { showdownPlayers, seated, newSpectators, stackCredits };
-}
-
-// Seat chhodne walon ke bache stacks wallet mein credit (idempotent per hand)
-async function creditStacks(
-  stackCredits: StackCredit[], tableId: string, tableName: string, handNumber: number,
-): Promise<void> {
-  for (const c of stackCredits) {
-    try {
-      await internalWalletTransaction({
-        action: 'ADD', uid: c.uid, amount: c.chips,
-        balanceType: 'winningBalance', type: 'CASH_OUT', game: 'Poker',
-        description: `Chips returned from "${tableName}"`,
-        idempotencyKey: `poker_stackcredit_${tableId}_${c.uid}_${handNumber}`,
-      });
-    } catch (e) {
-      console.error('[STACK CREDIT FAILED]', { tableId, handNumber, uid: c.uid, chips: c.chips, e });
-      await db.collection('payoutRetryQueue').add({
-        kind: 'poker_stack_credit', tableId, handNumber,
-        uid: c.uid, amount: c.chips,
-        idempotencyKeys: [`poker_stackcredit_${tableId}_${c.uid}_${handNumber}`],
-        error: e instanceof Error ? e.message : String(e),
-        createdAt: FieldValue.serverTimestamp(),
-        attempts: 1, resolved: false,
-      }).catch(() => {});
-    }
-  }
+  return { showdownPlayers, seated, newSpectators };
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -441,16 +405,8 @@ function buildFreshHandState(
   const handNumber = (table.handNumber || 0) + 1;
   const n          = players.length;
   const dealerIdx  = handNumber % n;
-  // Real rule: heads-up mein dealer/button hi SMALL blind hota hai aur preflop
-  // pehle act karta hai — pehle dealer ko BB de rahe the (ulta)
-  let sbIdx: number, bbIdx: number;
-  if (n === 2) {
-    sbIdx = dealerIdx;
-    bbIdx = (dealerIdx + 1) % 2;
-  } else {
-    sbIdx = (dealerIdx + 1) % n;
-    bbIdx = (dealerIdx + 2) % n;
-  }
+  const sbIdx      = (dealerIdx + 1) % n;
+  const bbIdx      = (dealerIdx + 2) % n;
 
   players.forEach((p, i) => {
     p.holeCards          = [];
@@ -522,9 +478,8 @@ function buildFreshHandState(
       deck,
       pot,
       currentBet,
-      lastRaiseSize:    table.bigBlind, // preflop open = BB raise size
       sidePots:         [],
-      dealerSeat:       players[dealerIdx].seatIndex, // real seat index (odd-chip award isi se hota hai)
+      dealerSeat:       dealerIdx,
       activePlayerUid:  firstToActIdx >= 0 ? players[firstToActIdx].uid : null,
       turnExpiresAt:    firstToActIdx >= 0
         ? Timestamp.fromDate(new Date(Date.now() + TURN_SECS * 1000))
@@ -545,8 +500,8 @@ function buildFreshHandState(
 // settleHand
 // ─────────────────────────────────────────────────────────────────────────────
 async function settleHand(
-  tx:             Transaction,
-  tableRef:       DocumentReference,
+  tx:             FirebaseFirestore.Transaction,
+  tableRef:       FirebaseFirestore.DocumentReference,
   table:          PokerTable,
   players:        PokerPlayer[],
   communityCards: Card[],
@@ -555,7 +510,6 @@ async function settleHand(
   payouts:      Array<{ uid: string; amount: number; totalBet: number; name: string; handRank: string }>;
   brokePlayers: Array<{ uid: string; name: string }>;
   allPlayers:   PokerPlayer[];
-  stackCredits: StackCredit[];
 }> {
   const sidePots   = buildSidePots(players);
   const contenders = players.filter(p => p.status === 'active' || p.status === 'allin');
@@ -611,7 +565,7 @@ async function settleHand(
     if (p.chips <= 0) brokePlayers.push({ uid: p.uid, name: p.name });
   });
 
-  const { showdownPlayers, seated, newSpectators, stackCredits } = separatePlayersAfterHand(settledPlayers);
+  const { showdownPlayers, seated, newSpectators } = separatePlayersAfterHand(settledPlayers);
 
   const finalQueue = [
     ...spectatorQueue.filter(s => !newSpectators.some((ns: any) => ns.uid === s.uid)),
@@ -662,7 +616,7 @@ async function settleHand(
       return { uid, amount, totalBet: s?.totalBet || 0, name: s?.name || '', handRank: s?.handRank || '' };
     });
 
-  return { payouts, brokePlayers, allPlayers: snapshot, stackCredits };
+  return { payouts, brokePlayers, allPlayers: snapshot };
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -714,15 +668,15 @@ async function processPayouts(
 // advancePhase
 // ─────────────────────────────────────────────────────────────────────────────
 async function advancePhase(
-  tx:        Transaction,
-  tableRef:  DocumentReference,
+  tx:        FirebaseFirestore.Transaction,
+  tableRef:  FirebaseFirestore.DocumentReference,
   table:     PokerTable,
   players:   PokerPlayer[],
   deck:      Card[],
   community: Card[],
   pot:       number,
   queue:     any[],
-): Promise<{ settled: boolean; payouts: any[]; allPlayers: PokerPlayer[]; stackCredits: StackCredit[] }> {
+): Promise<{ settled: boolean; payouts: any[]; allPlayers: PokerPlayer[] }> {
   const active = players.filter(p => p.status === 'active');
   const allIn  = players.filter(p => p.status === 'allin');
 
@@ -765,7 +719,6 @@ async function advancePhase(
     phase:            nextPhase,
     pot,
     currentBet:       0,
-    lastRaiseSize:    0, // nayi street — pehla bet min bigBlind hota hai
     sidePots:         buildSidePots(players),
     activePlayerUid:  fp?.uid || null,
     turnExpiresAt:    fp ? Timestamp.fromDate(new Date(Date.now() + TURN_SECS * 1000)) : null,
@@ -775,7 +728,7 @@ async function advancePhase(
     lastActionAt:     FieldValue.serverTimestamp(),
   });
 
-  return { settled: false, payouts: [], allPlayers: [], stackCredits: [] };
+  return { settled: false, payouts: [], allPlayers: [] };
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -789,7 +742,6 @@ interface ActionResult {
   settled:             boolean;
   everyoneLeft:        boolean;
   everyoneLeftPlayers: PokerPlayer[];
-  stackCredits:        StackCredit[];
 }
 
 async function executeAction(
@@ -805,7 +757,6 @@ async function executeAction(
   let settled     = false;
   let everyoneLeft = false;
   let everyoneLeftPlayers: PokerPlayer[] = [];
-  let stackCredits: StackCredit[] = [];
 
   await db.runTransaction(async tx => {
     const tableRef = db.collection(POKER).doc(tableId);
@@ -827,7 +778,6 @@ async function executeAction(
     const comm   = [...table.communityCards];
     let pot      = table.pot;
     let curBet   = table.currentBet;
-    let lastRaiseSize = table.lastRaiseSize || table.bigBlind;
 
     const pIdx = players.findIndex(p => p.uid === actingUid);
     if (pIdx === -1) throw new Error('Player not found');
@@ -869,9 +819,7 @@ async function executeAction(
         break;
       }
       case 'raise': {
-        // Real rule: min raise-to = currentBet + last raise size (double nahi).
-        // Postflop pehla bet: min = bigBlind.
-        const minT = curBet > 0 ? curBet + lastRaiseSize : table.bigBlind;
+        const minT = curBet + Math.max(curBet, table.bigBlind);
         const maxT = player.chips + player.bet;
         if (!raiseAmount || raiseAmount < minT)
           throw new Error(`Minimum raise is ₹${minT}`);
@@ -882,7 +830,6 @@ async function executeAction(
         player.bet      += toAdd;
         player.totalBet += toAdd;
         pot             += toAdd;
-        lastRaiseSize    = player.bet - curBet;
         curBet           = player.bet;
         if (player.chips === 0) player.status = 'allin';
         player.isTurn            = false;
@@ -910,19 +857,11 @@ async function executeAction(
         player.lastActionAmount  = amt;
         player.turnStartedAt     = null;
         if (player.bet > curBet) {
-          // Real rule: short all-in (poore min-raise se kam) betting REOPEN
-          // nahi karta — jo act kar chuke hain woh sirf call/fold kar sakte
-          // hain. Sirf FULL raise hone pe hasActedThisRound reset hota hai.
-          const raiseSize   = player.bet - curBet;
-          const isFullRaise = raiseSize >= lastRaiseSize;
           curBet = player.bet;
-          if (isFullRaise) {
-            lastRaiseSize = raiseSize;
-            players.forEach((p, i) => {
-              if (i !== pIdx && p.status === 'active' && p.bet < curBet)
-                p.hasActedThisRound = false;
-            });
-          }
+          players.forEach((p, i) => {
+            if (i !== pIdx && p.status === 'active' && p.bet < curBet)
+              p.hasActedThisRound = false;
+          });
         }
         break;
       }
@@ -937,13 +876,11 @@ async function executeAction(
 
     const nonFolded = players.filter(p => p.status !== 'folded' && p.status !== 'left');
 
-    // Everyone folded (edge case) — pot ka paisa players ko wapas (totalBet),
-    // chips table pe hi rehte hain. FIX: pehle handler wallet-refund BHI karta
-    // tha (double credit) aur pot destroy hota tha.
+    // Everyone folded
     if (nonFolded.length === 0) {
       tx.update(tableRef, {
         ...cleanHandState(),
-        players:      sp(players.map(p => cleanPlayer(p, p.chips + p.totalBet))),
+        players:      sp(players.map(p => cleanPlayer(p, p.chips))),
         phase:        'waiting',
         status:       'waiting',
         updatedAt:    FieldValue.serverTimestamp(),
@@ -962,8 +899,7 @@ async function executeAction(
       const settled1 = players.map(p =>
         cleanPlayer(p, p.uid === winner.uid ? p.chips + pot : p.chips)
       );
-      const { showdownPlayers, seated, newSpectators, stackCredits: sc1 } = separatePlayersAfterHand(settled1);
-      stackCredits = sc1;
+      const { showdownPlayers, seated, newSpectators } = separatePlayersAfterHand(settled1);
       const finalQueue = [
         ...queue.filter(s => !newSpectators.some((ns: any) => ns.uid === s.uid)),
         ...newSpectators,
@@ -1014,10 +950,9 @@ async function executeAction(
     if (bettingComplete(players, curBet)) {
       const result = await advancePhase(tx, tableRef, table, players, deck, comm, pot, queue);
       if (result.settled) {
-        payouts      = result.payouts;
-        allPlayers   = result.allPlayers;
-        stackCredits = result.stackCredits;
-        settled      = true;
+        payouts    = result.payouts;
+        allPlayers = result.allPlayers;
+        settled    = true;
       }
       return;
     }
@@ -1031,7 +966,6 @@ async function executeAction(
       players:          sp(players),
       pot,
       currentBet:       curBet,
-      lastRaiseSize,
       sidePots:         buildSidePots(players),
       activePlayerUid:  next?.uid || null,
       turnExpiresAt:    next
@@ -1044,18 +978,19 @@ async function executeAction(
     });
   });
 
-  return { payouts, allPlayers, tableName, handNumber, settled, everyoneLeft, everyoneLeftPlayers, stackCredits };
+  return { payouts, allPlayers, tableName, handNumber, settled, everyoneLeft, everyoneLeftPlayers };
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
 // HTTP Handler — the entire switch lives inside this async function
 // ─────────────────────────────────────────────────────────────────────────────
-export default async function handler(req: VercelRequest, res: VercelResponse): Promise<any> {
-      setCors(res);
-       if (req.method === "OPTIONS") {
-    return res.status(200).end();
-   }
-  
+export default async function handler(req: VercelRequest, res: VercelResponse): Promise<void> {
+  setCors(req, res);
+  if (req.method === 'OPTIONS') {
+    res.status(204).end();
+    return;
+  }
+
   if (req.method !== 'POST') {
     res.status(405).json({ error: 'Method not allowed' });
     return;
@@ -1103,40 +1038,15 @@ export default async function handler(req: VercelRequest, res: VercelResponse): 
       const activeSeated = table.players.filter(p => p.seatStatus !== 'LEFT_SEAT').length;
 
       if (buyIn === 0 || activeSeated >= 6 || table.status === 'playing') {
-        // FIX: queue mein jaane se pehle hi buy-in katta hai — warna promotion
-        // pe free chips mil jaate the (paise kabhi kate hi nahi)
-        const queueTs = Date.now();
-        if (buyIn > 0) {
-          try {
-            await internalWalletTransaction({
-              action: 'DEDUCT', uid, amount: buyIn, balanceType: 'winningBalance',
-              type: 'GAME_ENTRY', game: 'Poker',
-              description: `Poker buy-in (queued) at "${table.name}"`,
-              idempotencyKey: `poker_queue_${tableId}_${uid}_${queueTs}`,
-            });
-          } catch (e: any) { res.status(402).json({ error: e.message || 'Insufficient balance' }); return; }
-        }
-        try {
-          await tableRef.update({
-            spectatorQueue: FieldValue.arrayUnion({
-              uid, name, avatar: avatar || '', buyIn,
-              seatIndex: seatIndex ?? null,
-              joinedAt:    Timestamp.now(),
-              paidTs:      buyIn > 0 ? queueTs : null,
-              isSpectator: buyIn === 0,
-            }),
-            updatedAt: FieldValue.serverTimestamp(),
-          });
-        } catch (e: any) {
-          if (buyIn > 0) {
-            await internalWalletTransaction({
-              action: 'ADD', uid, amount: buyIn, balanceType: 'winningBalance',
-              type: 'REFUND', game: 'Poker', description: 'Refund: queue join failed',
-              idempotencyKey: `poker_queue_refund_${tableId}_${uid}_${queueTs}`,
-            }).catch(() => {});
-          }
-          res.status(500).json({ error: e.message }); return;
-        }
+        await tableRef.update({
+          spectatorQueue: FieldValue.arrayUnion({
+            uid, name, avatar: avatar || '', buyIn,
+            seatIndex: seatIndex ?? null,
+            joinedAt:    Timestamp.now(),
+            isSpectator: buyIn === 0,
+          }),
+          updatedAt: FieldValue.serverTimestamp(),
+        });
         res.status(200).json({ role: 'spectator' }); return;
       }
 
@@ -1226,7 +1136,6 @@ export default async function handler(req: VercelRequest, res: VercelResponse): 
         });
       } catch (e: any) { res.status(402).json({ error: e.message || 'Insufficient balance' }); return; }
 
-      let queuedPaid: { buyIn: number; paidTs: number } | null = null;
       try {
         await db.runTransaction(async tx => {
           const t   = await tx.get(tableRef);
@@ -1237,10 +1146,6 @@ export default async function handler(req: VercelRequest, res: VercelResponse): 
           if (seat === -1 || occ2.has(seat)) { seat = 0; while (occ2.has(seat) && seat < 6) seat++; }
           if (seat >= 6) throw new Error('No seats');
           const spec = cur.spectatorQueue.find((s: any) => s.uid === uid);
-          // Queue mein pehle se paid buy-in tha? Woh refund hoga (niche) —
-          // warna queue entry ke saath uska paisa bhi silently delete ho jata
-          if (spec && (spec.buyIn || 0) > 0 && spec.paidTs)
-            queuedPaid = { buyIn: spec.buyIn, paidTs: spec.paidTs };
           const newP: PokerPlayer = {
             uid,
             name:   existing?.name || spec?.name || 'Player',
@@ -1267,15 +1172,6 @@ export default async function handler(req: VercelRequest, res: VercelResponse): 
           idempotencyKey: `poker_takeseat_refund_${tableId}_${uid}_${joinTs}`,
         }).catch(() => {});
         res.status(500).json({ error: e.message }); return;
-      }
-      // Queue wala paid buy-in refund — seat ke liye naya buy-in already kat chuka
-      if (queuedPaid) {
-        await internalWalletTransaction({
-          action: 'ADD', uid, amount: queuedPaid.buyIn, balanceType: 'winningBalance',
-          type: 'REFUND', game: 'Poker',
-          description: `Queue buy-in refund from "${table.name}"`,
-          idempotencyKey: `poker_queue_refund_${tableId}_${uid}_${queuedPaid.paidTs}`,
-        }).catch(e => console.error('[TAKE-SEAT QUEUE REFUND]', e));
       }
       res.status(200).json({ ok: true, role: 'player' }); return;
     }
@@ -1324,9 +1220,6 @@ export default async function handler(req: VercelRequest, res: VercelResponse): 
     // ── START HAND ────────────────────────────────────────────────────────────
     if (type === 'start-hand') {
       if (!tableId) { res.status(400).json({ error: 'tableId required' }); return; }
-      let startStackCredits: StackCredit[] = [];
-      let startHandNumber = 0;
-      let startTableName  = '';
       try {
         await db.runTransaction(async tx => {
           const snap = await tx.get(tableRef);
@@ -1345,10 +1238,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse): 
 
           // Pre-clean all players through cleanPlayer()
           const preCleaned = table.players.map(p => cleanPlayer(p, p.chips));
-          const { seated, newSpectators, stackCredits: pendingCredits } = separatePlayersAfterHand(preCleaned);
-          startStackCredits = pendingCredits;
-          startHandNumber   = table.handNumber || 0;
-          startTableName    = table.name;
+          const { seated, newSpectators } = separatePlayersAfterHand(preCleaned);
 
           const mergedQueue = [
             ...(table.spectatorQueue || []).filter(
@@ -1362,10 +1252,6 @@ export default async function handler(req: VercelRequest, res: VercelResponse): 
 
           tx.update(tableRef, fresh.update);
         });
-        // Showdown ke waqt jo credits reh gaye the (e.g. AFK removal ke baad
-        // settle ke bina) — safety net, idempotent keys se double-pay nahi hoga
-        if (startStackCredits.length)
-          await creditStacks(startStackCredits, tableId, startTableName, startHandNumber);
         res.status(200).json({ ok: true }); return;
       } catch (e: any) {
         const expected = [
@@ -1389,12 +1275,20 @@ export default async function handler(req: VercelRequest, res: VercelResponse): 
         res.status(400).json({ error: 'raiseAmount required' }); return;
       }
       const result = await executeAction(tableId, uid, action, raiseAmount);
-      // everyoneLeft: pot ab transaction ke andar hi players ko chips mein
-      // wapas hota hai — yahan koi wallet refund nahi (double-credit fix)
+      if (result.everyoneLeft) {
+        for (const p of result.everyoneLeftPlayers) {
+          if (p.chips > 0) {
+            await internalWalletTransaction({
+              action: 'ADD', uid: p.uid, amount: p.chips,
+              balanceType: 'winningBalance', type: 'REFUND', game: 'Poker',
+              description: 'Poker refund — all left',
+              idempotencyKey: `poker_everyone_left_${tableId}_${result.handNumber}_${p.uid}`,
+            }).catch(() => {});
+          }
+        }
+      }
       if (result.settled && result.payouts.length)
         await processPayouts(result.payouts, result.allPlayers, result.tableName, tableId, result.handNumber);
-      if (result.stackCredits.length)
-        await creditStacks(result.stackCredits, tableId, result.tableName, result.handNumber);
       res.status(200).json({ ok: true }); return;
     }
 
@@ -1455,8 +1349,6 @@ export default async function handler(req: VercelRequest, res: VercelResponse): 
         }
         if (result.settled && result.payouts.length)
           await processPayouts(result.payouts, result.allPlayers, result.tableName, tableId, result.handNumber);
-        if (result.stackCredits.length)
-          await creditStacks(result.stackCredits, tableId, result.tableName, result.handNumber);
         res.status(200).json({ ok: true, action: 'afk_seat_removed' }); return;
       }
 
@@ -1468,8 +1360,6 @@ export default async function handler(req: VercelRequest, res: VercelResponse): 
 
       if (result.settled && result.payouts.length) {
         await processPayouts(result.payouts, result.allPlayers, result.tableName, tableId, result.handNumber);
-        if (result.stackCredits.length)
-          await creditStacks(result.stackCredits, tableId, result.tableName, result.handNumber);
         res.status(200).json({ ok: true, action: autoAct }); return;
       }
       if (!result.settled) {
@@ -1517,14 +1407,8 @@ export default async function handler(req: VercelRequest, res: VercelResponse): 
     }
 
     // ── LEAVE ─────────────────────────────────────────────────────────────────
-    // FIX (real poker rule): mid-hand leave = FOLD. Player array mein hi rehta
-    // hai (LEFT_SEAT, chips 0) taaki uska totalBet dead money bane aur pot
-    // winner ko mile — pehle player hata dete the aur uski bet gayab ho jaati thi.
-    // Bacha stack wallet mein credit hota hai. Queue se leave pe paid buy-in refund.
     if (type === 'leave') {
       let chipsToReturn = 0;
-      let queueRefund   = 0;
-      let queuePaidTs   = 0;
       let tableName_    = '';
       let joinedAtMs    = 0;
 
@@ -1533,48 +1417,30 @@ export default async function handler(req: VercelRequest, res: VercelResponse): 
         if (!snap.exists) throw new Error('Table not found');
         const table   = snap.data() as PokerTable;
         const player  = table.players.find(p => p.uid === uid);
-        const spec    = (table.spectatorQueue || []).find((s: any) => s.uid === uid);
-        if (!player && !spec) return;
+        const inQueue = (table.spectatorQueue || []).some((s: any) => s.uid === uid);
+        if (!player && !inQueue) return;
 
-        tableName_ = table.name;
-        if (spec && !player && (spec.buyIn || 0) > 0 && spec.paidTs) {
-          queueRefund = spec.buyIn;
-          queuePaidTs = spec.paidTs;
-        }
         if (player) {
           chipsToReturn = player.chips;
+          tableName_    = table.name;
           joinedAtMs    = player.joinedAt?.toMillis?.() || (player.joinedAt?._seconds || 0) * 1000;
         }
 
-        const remQ = (table.spectatorQueue || []).filter((s: any) => s.uid !== uid);
-        const inHand = player && table.status === 'playing' &&
-          (player.status === 'active' || player.status === 'allin' || player.status === 'disconnected');
+        const remP  = table.players.filter(p => p.uid !== uid);
+        const remQ  = (table.spectatorQueue || []).filter((s: any) => s.uid !== uid);
+        const update: Record<string, any> = {
+          players:        sp(remP),
+          spectatorQueue: remQ,
+          updatedAt:      FieldValue.serverTimestamp(),
+        };
 
-        if (inHand) {
-          // Fold + seat vacate — totalBet pot mein rehta hai (dead money)
-          const foldedP = table.players.map(p =>
-            p.uid === uid
-              ? {
-                  ...p, status: 'folded' as PlayerStatus, seatStatus: 'LEFT_SEAT' as SeatStatus,
-                  chips: 0, holeCards: [], isTurn: false, leaveRequested: false,
-                  lastAction: 'fold', turnStartedAt: null,
-                }
-              : p
-          );
-          const update: Record<string, any> = {
-            players:        sp(foldedP),
-            spectatorQueue: remQ,
-            updatedAt:      FieldValue.serverTimestamp(),
-          };
-
-          const nonFolded = foldedP.filter(
+        if (table.status === 'playing' && player) {
+          const nonFolded = remP.filter(
             p => p.status !== 'folded' && p.status !== 'left' && p.seatStatus !== 'LEFT_SEAT'
           );
-
           if (nonFolded.length === 1) {
-            // Winner by fold — poora pot (leaver ki dead money samet) winner ko
-            const winner = nonFolded[0];
-            const finalP = foldedP.map(p => ({
+            const winner  = nonFolded[0];
+            const finalP  = remP.map(p => ({
               ...cleanPlayer(p, p.uid === winner.uid ? p.chips + table.pot : p.chips),
               holeCards: p.uid === winner.uid ? p.holeCards : [],
               handRank:  p.uid === winner.uid ? 'Won by Fold' : '',
@@ -1594,11 +1460,18 @@ export default async function handler(req: VercelRequest, res: VercelResponse): 
               lastHandWins:   { [winner.uid]: table.pot },
               lastHandAllIn:  false,
             });
+          } else if (nonFolded.length === 0) {
+            Object.assign(update, {
+              ...cleanHandState(),
+              players: sp(remP.map(p => cleanPlayer(p, p.chips))),
+              phase:   'waiting',
+              status:  'waiting',
+            });
           } else if (table.activePlayerUid === uid) {
-            const nextActive = foldedP.find(p => p.status === 'active');
+            const nextActive = remP.find(p => p.status === 'active');
             if (nextActive) {
               Object.assign(update, {
-                players: sp(foldedP.map(p =>
+                players: sp(remP.map(p =>
                   p.uid === nextActive.uid
                     ? { ...p, isTurn: true, turnStartedAt: Timestamp.now() }
                     : p
@@ -1610,22 +1483,16 @@ export default async function handler(req: VercelRequest, res: VercelResponse): 
               });
             }
           }
-
-          tx.update(tableRef, update);
-          return;
+        } else if (table.status !== 'playing') {
+          if (remP.filter(p => p.seatStatus !== 'LEFT_SEAT').length < 2) {
+            Object.assign(update, {
+              ...cleanHandState(),
+              phase:  'waiting',
+              status: 'waiting',
+            });
+          }
         }
 
-        // Hand mein nahi (waiting/showdown/spectator) — seedha remove
-        const remP = table.players.filter(p => p.uid !== uid);
-        const update: Record<string, any> = {
-          players:        sp(remP),
-          spectatorQueue: remQ,
-          updatedAt:      FieldValue.serverTimestamp(),
-        };
-        if (table.status !== 'playing' &&
-            remP.filter(p => p.seatStatus !== 'LEFT_SEAT').length < 2) {
-          Object.assign(update, { ...cleanHandState(), phase: 'waiting', status: 'waiting' });
-        }
         tx.update(tableRef, update);
       });
 
@@ -1636,14 +1503,6 @@ export default async function handler(req: VercelRequest, res: VercelResponse): 
           description: `Chips returned from "${tableName_}"`,
           idempotencyKey: `poker_leave_${tableId}_${uid}_${joinedAtMs}`,
         }).catch(e => console.error('[LEAVE]', e));
-      }
-      if (queueRefund > 0) {
-        await internalWalletTransaction({
-          action: 'ADD', uid, amount: queueRefund,
-          balanceType: 'winningBalance', type: 'REFUND', game: 'Poker',
-          description: `Queue buy-in refund from "${tableName_}"`,
-          idempotencyKey: `poker_queue_refund_${tableId}_${uid}_${queuePaidTs}`,
-        }).catch(e => console.error('[LEAVE QUEUE REFUND]', e));
       }
       res.status(200).json({ ok: true }); return;
     }
@@ -1683,9 +1542,6 @@ export default async function handler(req: VercelRequest, res: VercelResponse): 
           const ft  = fs.data() as PokerTable;
           const idx = ft.players.findIndex(p => p.uid === uid);
           if (idx === -1) throw new Error('Player not found');
-          // FIX: chips check transaction ke ANDAR — do concurrent rebuy mein
-          // dusra yahan fail hoga aur refund milega (pehle double-deduct hota tha)
-          if (ft.players[idx].chips > 0) throw new Error('You still have chips');
           tx.update(tableRef, {
             players:   sp(ft.players.map((p, i) => i === idx ? cleanPlayer({ ...p, chips: 0 }, amount) : p)),
             updatedAt: FieldValue.serverTimestamp(),

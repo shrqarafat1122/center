@@ -1,9 +1,9 @@
 // api/tictactoe/action.ts
-import type { VercelRequest, VercelResponse } from '../lib/vercelShim';
-import { FieldValue, Timestamp }              from '../lib/firestoreRest';
+import type { VercelRequest, VercelResponse } from '@vercel/node';
+import { FieldValue }                         from 'firebase-admin/firestore';
 import { db }                                 from '../lib/firebaseAdmin';
 import { internalWalletTransaction }          from '../lib/walletInternal';
-import { verifyToken, sanitize }              from '../lib/middleware';
+import { verifyToken, sanitize, setCors }     from '../lib/middleware';
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Constants & Types
@@ -25,7 +25,7 @@ interface TTTPlayer {
   uid:      string;
   userName: string;
   symbol:   TPlayer;
-  joinedAt: Timestamp;
+  joinedAt: FirebaseFirestore.Timestamp;
 }
 
 interface TTTTable {
@@ -43,10 +43,10 @@ interface TTTTable {
   prize:           number;
   settled:         boolean;
   payoutAttempted: boolean;
-  createdAt:       Timestamp;
-  updatedAt:       Timestamp;
-  lastMoveAt:      Timestamp | null;
-  expiresAt:       Timestamp;
+  createdAt:       FirebaseFirestore.Timestamp;
+  updatedAt:       FirebaseFirestore.Timestamp;
+  lastMoveAt:      FirebaseFirestore.Timestamp | null;
+  expiresAt:       FirebaseFirestore.Timestamp;
   forfeitedBy?:    string;
   matchEndedAt?:   string;
   resetAt?:        string;
@@ -174,6 +174,11 @@ const processPayout = async (tableId: string): Promise<void> => {
 // ─────────────────────────────────────────────────────────────────────────────
 
 export default async function handler(req: VercelRequest, res: VercelResponse) {
+  setCors(req, res);
+  if (req.method === 'OPTIONS') {
+    res.status(204).end();
+    return;
+  }
 
   if (req.method !== 'POST') {
     res.status(405).json({ ok: false, error: 'Method not allowed' });
