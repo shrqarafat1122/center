@@ -352,6 +352,7 @@ async function handleAction(req: VercelRequest, res: VercelResponse, uid: string
         discardPile,
         [`playerData.${uid}.handCount`]: newHand.length,
         [`playerData.${uid}.hasActed`]:  true,
+        [`playerData.${uid}.missedTurns`]: 0, // manual action = reset missed
         ...turn,
       });
       return { action: 'discard', cardId, nextTurnUid: turn.currentTurnUid };
@@ -650,6 +651,7 @@ async function handleAutoDiscard(req: VercelRequest, res: VercelResponse, uid: s
   sanitize(req.body, ['tableId']);
   const { tableId } = req.body;
 
+  const tableRef  = db.collection('jokerPairTables').doc(tableId);
   const gameRef   = db.collection('jokerPairGames').doc(tableId);
   const myPrivRef = gameRef.collection('private').doc(uid);
   const srvRef    = gameRef.collection('private').doc('_server');
@@ -667,6 +669,23 @@ async function handleAutoDiscard(req: VercelRequest, res: VercelResponse, uid: s
     const elapsed  = (Date.now() - game.turnStartedAt) / 1000;
     const duration = game.turnDuration || 60;
     if (elapsed < duration - 2) return { skipped: true, reason: 'Turn not expired yet' };
+
+    // ── 3 missed turns = forfeit — opponent jeet jata hai ────────────────────
+    const missed = ((game.playerData?.[uid]?.missedTurns || 0) as number) + 1;
+    if (missed >= 3) {
+      const winnerId = (game.players as string[]).find((p) => p !== uid) ?? null;
+      tx.update(gameRef, {
+        status:       'finished',
+        finishedAt:   FieldValue.serverTimestamp(),
+        winnerId,
+        loserId:      uid,
+        finishReason: 'turn_forfeit',
+        payoutDone:   false,
+        [`playerData.${uid}.missedTurns`]: missed,
+      });
+      tx.update(tableRef, { status: 'finished' });
+      return { forfeited: true, winnerId, loserId: uid, missedTurns: missed };
+    }
 
     if (!privSnap.exists) throw new Error('Player not found');
     const priv        = privSnap.data()!;
@@ -700,10 +719,37 @@ async function handleAutoDiscard(req: VercelRequest, res: VercelResponse, uid: s
       drawCount: drawPile.length,
       [`playerData.${uid}.handCount`]: hand.length,
       [`playerData.${uid}.hasActed`]:  true,
+      [`playerData.${uid}.missedTurns`]: missed, // track missed turns
       ...turn,
     });
-    return { autoDiscarded: cardToDiscard, nextTurnUid: turn.currentTurnUid };
+    return { autoDiscarded: cardToDiscard, nextTurnUid: turn.currentTurnUid, missedTurns: missed };
   });
+
+  // ── Forfeit hua toh winner ko payout karo ──────────────────────────────────
+  if (result.forfeited && result.winnerId) {
+    const tableSnap = await tableRef.get();
+    const prizePool = (tableSnap.data()?.prizePool || 0) as number;
+    const commission = Math.floor(prizePool * 0.10);
+    const winnerPrize = prizePool - commission;
+
+    if (winnerPrize > 0) {
+      try {
+        await internalWalletTransaction({
+          action:         'ADD',
+          uid:            result.winnerId,
+          amount:         winnerPrize,
+          type:           'GAME_WIN',
+          game:           'JokerPair',
+          description:    `Joker Pair win (opponent timeout forfeit) - Table ${tableId}`,
+          balanceType:    'winningBalance',
+          idempotencyKey: `jp_win_forfeit_${tableId}_${result.winnerId}`,
+        });
+        await gameRef.update({ payoutDone: true });
+      } catch (err) {
+        console.error('[PAYOUT FAILED] Forfeit payout:', { tableId, winnerId: result.winnerId, err });
+      }
+    }
+  }
 
   return res.status(200).json({ success: true, ...result });
 }
